@@ -1,0 +1,160 @@
+name: Update Viewer
+
+on:
+  schedule:
+    - cron: "0 3 * * 1" # Every Monday at 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read current config from index.html
+        id: config
+        run: |
+          HANDLE=$(grep -oP 'const HANDLE = "\K[^"]+' index.html)
+          RKEY=$(grep -oP 'const PUBLICATION_RKEY = "\K[^"]+' index.html)
+          BASE_PATH=$(grep -oP 'const BASE_PATH = "\K[^"]*' index.html | head -1)
+          echo "handle=$HANDLE" >> "$GITHUB_OUTPUT"
+          echo "rkey=$RKEY" >> "$GITHUB_OUTPUT"
+          echo "base_path=$BASE_PATH" >> "$GITHUB_OUTPUT"
+          echo "HANDLE=$HANDLE, RKEY=$RKEY, BASE_PATH=$BASE_PATH"
+
+      - name: Read DID from .well-known
+        id: did
+        run: |
+          # Format: at://did:xxx:yyy/site.standard.publication/rkey
+          DID=$(cut -d'/' -f3 .well-known/site.standard.publication)
+          echo "did=$DID" >> "$GITHUB_OUTPUT"
+          echo "DID=$DID"
+
+      - name: Fetch publication details from Bluesky
+        id: pub
+        run: |
+          HANDLE="${{ steps.config.outputs.handle }}"
+          RKEY="${{ steps.config.outputs.rkey }}"
+          DID="${{ steps.did.outputs.did }}"
+
+          # Resolve DID → PDS
+          if [[ "$DID" == did:plc:* ]]; then
+            DID_DOC=$(curl -fsSL "https://plc.directory/${DID}")
+          elif [[ "$DID" == did:web:* ]]; then
+            WEB_HOST="${DID#did:web:}"
+            WEB_HOST="${WEB_HOST//:///}"
+            DID_DOC=$(curl -fsSL "https://${WEB_HOST}/.well-known/did.json")
+          else
+            echo "Unsupported DID method: ${DID}" >&2
+            exit 1
+          fi
+
+          PDS_URL=$(echo "$DID_DOC" | python3 -c "
+          import sys, json
+          doc = json.load(sys.stdin)
+          for s in doc.get('service', []):
+              if s.get('id') == '#atproto_pds' or s.get('type') == 'AtprotoPersonalDataServer':
+                  print(s['serviceEndpoint'])
+                  break
+          ")
+          if [ -z "$PDS_URL" ]; then
+            echo "No PDS service found in DID document for ${DID}" >&2
+            exit 1
+          fi
+
+          # Fetch publication record
+          DID_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$DID")
+          RKEY_ENC=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$RKEY")
+          RECORD=$(curl -fsSL "${PDS_URL}/xrpc/com.atproto.repo.getRecord?repo=${DID_ENC}&collection=site.standard.publication&rkey=${RKEY_ENC}")
+
+          PUB_NAME=$(echo "$RECORD" | python3 -c "import sys,json; v=json.load(sys.stdin).get('value',{}); print(v.get('name',''))")
+          PUB_DESC=$(echo "$RECORD" | python3 -c "import sys,json; v=json.load(sys.stdin).get('value',{}); print(v.get('description',''))")
+          PUB_URL=$(echo "$RECORD"  | python3 -c "import sys,json; v=json.load(sys.stdin).get('value',{}); print(v.get('url',''))")
+
+          echo "name=$PUB_NAME"   >> "$GITHUB_OUTPUT"
+          echo "description=$PUB_DESC" >> "$GITHUB_OUTPUT"
+          echo "url=$PUB_URL"    >> "$GITHUB_OUTPUT"
+          echo "pds_url=$PDS_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Derive base path from publication URL
+        id: paths
+        run: |
+          PUB_URL="${{ steps.pub.outputs.url }}"
+          BASE_PATH=$(python3 -c "
+          import sys
+          from urllib.parse import urlparse
+          url = sys.argv[1] if len(sys.argv) > 1 else ''
+          p = urlparse(url).path.rstrip('/')
+          print('' if not p or p == '/' else p)
+          " "$PUB_URL")
+          echo "base_path=$BASE_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Download upstream viewer files
+        env:
+          REPO_BASE: "https://raw.githubusercontent.com/SootyOwl/obsidian-standard-site/refs/heads/worktree-feat/social-cards/viewer"
+        run: |
+          curl -fsSL "${REPO_BASE}/index.html" -o index.html
+          curl -fsSL "${REPO_BASE}/404.html"   -o 404.html
+          mkdir -p .well-known
+          curl -fsSL "${REPO_BASE}/.well-known/site.standard.publication" -o .well-known/site.standard.publication
+          mkdir -p functions/_lib
+          curl -fgsSL "${REPO_BASE}/functions/[[path]].js"     -o "functions/[[path]].js"    || true
+          curl -fsSL  "${REPO_BASE}/functions/_lib/helpers.js" -o "functions/_lib/helpers.js" || true
+
+      - name: Patch index.html and 404.html
+        run: |
+          HANDLE="${{ steps.config.outputs.handle }}"
+          RKEY="${{ steps.config.outputs.rkey }}"
+          BASE_PATH="${{ steps.paths.outputs.base_path }}"
+          PUB_NAME="${{ steps.pub.outputs.name }}"
+          PUB_DESC="${{ steps.pub.outputs.description }}"
+          PUB_URL="${{ steps.pub.outputs.url }}"
+
+          escape_sed() { printf '%s' "$1" | sed 's/[&/\\]/\\&/g'; }
+
+          HANDLE_ESC=$(escape_sed "$HANDLE")
+          RKEY_ESC=$(escape_sed "$RKEY")
+          BASE_PATH_ESC=$(escape_sed "$BASE_PATH")
+          PUB_NAME_ESC=$(escape_sed "$PUB_NAME")
+          PUB_DESC_ESC=$(escape_sed "$PUB_DESC")
+          PUB_URL_ESC=$(escape_sed "$PUB_URL")
+
+          # index.html — config block
+          sed -i "s|const HANDLE = \".*\";|const HANDLE = \"${HANDLE_ESC}\";|" index.html
+          sed -i "s|const PUBLICATION_RKEY = \".*\";|const PUBLICATION_RKEY = \"${RKEY_ESC}\";|" index.html
+          sed -i "s|const BASE_PATH = \".*\";|const BASE_PATH = \"${BASE_PATH_ESC}\";|" index.html
+
+          # index.html — OG / title meta tags
+          sed -i "s|<title>[^<]*</title>|<title>${PUB_NAME_ESC}</title>|" index.html
+          sed -i "s|og:title\" content=\"[^\"]*\"|og:title\" content=\"${PUB_NAME_ESC}\"|" index.html
+          sed -i "s|og:description\" content=\"[^\"]*\"|og:description\" content=\"${PUB_DESC_ESC}\"|" index.html
+          sed -i "s|og:url\" content=\"[^\"]*\"|og:url\" content=\"${PUB_URL_ESC}\"|" index.html
+
+          # 404.html — BASE_PATH
+          sed -i "s|const BASE_PATH = \".*\";|const BASE_PATH = \"${BASE_PATH_ESC}\";|" 404.html
+
+      - name: Update .well-known/site.standard.publication
+        run: |
+          printf "at://%s/site.standard.publication/%s\n" \
+            "${{ steps.did.outputs.did }}" \
+            "${{ steps.config.outputs.rkey }}" \
+            > .well-known/site.standard.publication
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add index.html 404.html .well-known/site.standard.publication
+          # Add optional function files only if they exist
+          [ -f "functions/[[path]].js" ]     && git add "functions/[[path]].js"
+          [ -f "functions/_lib/helpers.js" ] && git add "functions/_lib/helpers.js"
+          if git diff --cached --quiet; then
+            echo "No changes – nothing to commit."
+          else
+            git commit -m "chore: update viewer from upstream"
+            git push origin HEAD:main
+          fi
