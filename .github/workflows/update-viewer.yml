@@ -28,7 +28,7 @@ jobs:
       - name: Read current config from index.html
         id: config
         run: |
-          HANDLE=$(grep -oP 'const HANDLE = "\K[^"]+' index.html)
+          HANDLE=$(grep -oP 'const HANDLE = "\K[^"]+' index.html | head -1)
           RKEY=$(grep -oP 'const PUBLICATION_RKEY = "\K[^"]+' index.html)
           BASE_PATH=$(grep -oP 'const BASE_PATH = "\K[^"]*' index.html | head -1)
           echo "handle=$HANDLE" >> "$GITHUB_OUTPUT"
