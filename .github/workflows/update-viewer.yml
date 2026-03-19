@@ -105,7 +105,7 @@ jobs:
 
       - name: Download upstream viewer files
         env:
-          REPO_BASE: "https://raw.githubusercontent.com/SootyOwl/obsidian-standard-site/refs/heads/worktree-feat/social-cards/viewer"
+          REPO_BASE: "https://raw.githubusercontent.com/SootyOwl/obsidian-standard-site/refs/heads/main/viewer"
         run: |
           curl -fsSL "${REPO_BASE}/index.html" -o index.html
           curl -fsSL "${REPO_BASE}/404.html"   -o 404.html
